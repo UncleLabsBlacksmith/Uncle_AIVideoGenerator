@@ -195,3 +195,20 @@ ffprobe -version
 **รูปแบบหลักสูตร:** 10 EP · สัปดาห์ละ 2 ชั่วโมง · รวม 20 ชั่วโมง
 
 [ดูรายละเอียดหลักสูตร AI Video Production Pipeline 101](https://uncle-engineer.com/course/ai-video-pipeline-101/)
+
+## Colab (ฟรี) — สร้างวิดีโอโดยไม่ใช้ OpenRouter video
+
+1. ใส่ใน `.env`: `COLAB_WORKER_TOKEN=รหัสลับของคุณ`
+2. รันแอป: `python app.py`
+3. เปิด tunnel ให้ Colab เรียกได้ เช่น `cloudflared tunnel --url http://localhost:5000`
+4. ใน Studio เลือกโมเดล **Google Colab (ฟรี · ต้องเปิด notebook)** แล้วกด Generate
+5. บน Colab: Runtime → T4 GPU · เปิดไฟล์ `colab/uncle_worker.py` (หรือ notebook) · ใส่ URL สาธารณะกับ token · รันลูป
+6. Worker จะ claim job → สร้างคลิป → อัปโหลดกลับ · แล้วกด Check / Assemble ในแอป
+
+API worker (ต้องมี header `X-Worker-Token`):
+- `POST /api/colab/next`
+- `POST /api/colab/result/<id>` (multipart `video`)
+- `GET /api/colab/jobs`
+- `POST /api/colab/requeue/<id>`
+
+Pilot แนะนำ: EP «หมา–แมวคุยกัน» ~8 scene × ~8 วินาที ≈ 1 นาที แล้ว Assemble

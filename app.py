@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask,render_template,request,jsonify,send_from_directory
 from dotenv import load_dotenv
+from colab_bridge import COLAB_MODEL, colab_model_item, is_colab_job, require_worker
 load_dotenv()
 ROOT=Path(__file__).resolve().parent
 DATA=ROOT/'projects'/'episodes.json'; OUTPUT=ROOT/'outputs'; OUTPUT.mkdir(exist_ok=True)
@@ -280,10 +281,16 @@ def delete_episode(slug):
  except Exception as e:return jsonify(error=str(e)),400
 @app.get('/api/models')
 def models():
+ items=[colab_model_item()]
+ err=''
  try:
-  result=api('GET','/videos/models');items=result if isinstance(result,list) else result.get('data',result.get('models',[]))
-  return jsonify(data=items,default_model=selected_model('video_generation'))
- except Exception as e:return jsonify(error=str(e)),400
+  result=api('GET','/videos/models');remote=result if isinstance(result,list) else result.get('data',result.get('models',[]))
+  if isinstance(remote,list):items.extend(remote)
+ except Exception as e:
+  err=str(e)
+ payload={'data':items,'default_model':selected_model('video_generation') or COLAB_MODEL}
+ if err:payload['openrouter_error']=err
+ return jsonify(payload)
 @app.post('/api/scene')
 def edit_scene():
  try:
@@ -360,14 +367,23 @@ def generate():
   if duration<5 or duration>10:raise ValueError('Duration must be 5–10 seconds')
   model=obj.get('model','').strip()
   if not model:raise ValueError('Choose a video model')
-  body={'model':model,'prompt':scene['prompt'],'duration':duration,'aspect_ratio':obj.get('aspect_ratio','9:16'),'resolution':obj.get('resolution','720p'),'generate_audio':False}
+  aspect=obj.get('aspect_ratio','9:16');resolution=obj.get('resolution','720p')
+  created=datetime.now(timezone.utc).isoformat()
+  if model==COLAB_MODEL:
+   job_id=f'colab-{uuid.uuid4().hex}'
+   result={'id':job_id,'status':'pending','generation_id':'','usage':{'cost':0}}
+   scene.update(job_id=job_id,status='pending',file='',model=model,duration=duration,resolution=resolution,aspect_ratio=aspect,generated_at=created,generation_id='',usage_cost=0,prompt=scene.get('prompt',''))
+   save(data)
+   jobs=load_video_jobs();jobs.insert(0,{'job_id':job_id,'slug':ep.get('slug',''),'episode_title':ep.get('title',''),'scene_id':int(obj['id']),'scene_title':scene.get('title',''),'model':model,'duration':duration,'resolution':resolution,'aspect_ratio':aspect,'status':'queued','file':'','generation_id':'','usage_cost':0,'created_at':created,'api_key_id':'colab','prompt':scene.get('prompt','')})
+   save_video_jobs(jobs);return jsonify(result)
+  body={'model':model,'prompt':scene['prompt'],'duration':duration,'aspect_ratio':aspect,'resolution':resolution,'generate_audio':False}
   result=api('POST','/videos',json=body)
-  created=datetime.now(timezone.utc).isoformat();usage=result.get('usage') or {}
+  usage=result.get('usage') or {}
   scene.update(job_id=result['id'],status=result.get('status','pending'),file='',model=model,duration=duration,generated_at=created,generation_id=result.get('generation_id',''),usage_cost=usage.get('cost') if isinstance(usage,dict) else None)
   save(data)
   config=key_config();key_id=config.get('active_id','')
   if not key_id and os.environ.get('OPENROUTER_API_KEY','').strip():key_id='env'
-  jobs=load_video_jobs();jobs.insert(0,{'job_id':result['id'],'slug':ep.get('slug',''),'episode_title':ep.get('title',''),'scene_id':int(obj['id']),'scene_title':scene.get('title',''),'model':model,'duration':duration,'resolution':body['resolution'],'aspect_ratio':body['aspect_ratio'],'status':result.get('status','pending'),'file':'','generation_id':result.get('generation_id',''),'usage_cost':usage.get('cost') if isinstance(usage,dict) else None,'created_at':created,'api_key_id':key_id})
+  jobs=load_video_jobs();jobs.insert(0,{'job_id':result['id'],'slug':ep.get('slug',''),'episode_title':ep.get('title',''),'scene_id':int(obj['id']),'scene_title':scene.get('title',''),'model':model,'duration':duration,'resolution':resolution,'aspect_ratio':aspect,'status':result.get('status','pending'),'file':'','generation_id':result.get('generation_id',''),'usage_cost':usage.get('cost') if isinstance(usage,dict) else None,'created_at':created,'api_key_id':key_id})
   save_video_jobs(jobs);return jsonify(result)
  except Exception as e:return jsonify(error=str(e)),400
 @app.post('/api/check')
@@ -376,6 +392,19 @@ def check():
   obj=request.get_json(force=True);data=load();ep,scene=locate(data,obj['slug'],obj['id']);job=scene.get('job_id')
   if not job:raise ValueError('No job yet')
   if '/' in job or '..' in job:raise ValueError('Invalid job ID')
+  if is_colab_job(job):
+   jobs=load_video_jobs();record=next((x for x in jobs if x.get('job_id')==job),None)
+   worker_status=(record or {}).get('status','queued')
+   status_map={'queued':'pending','running':'processing','done':'completed','failed':'failed'}
+   scene['status']=status_map.get(worker_status,worker_status)
+   scene['usage_cost']=0
+   if record and record.get('file'):scene['file']=record['file']
+   scene.setdefault('generated_at',(record or {}).get('created_at') or job_time(job))
+   if scene['status']=='completed' and scene.get('file'):
+    scene['completed_at']=scene.get('completed_at') or datetime.now(timezone.utc).isoformat()
+   save(data)
+   err=(record or {}).get('error')
+   return jsonify({'status':scene['status'],'file':scene.get('file',''),'error':err,'usage':{'cost':0}})
   result=api('GET',f'/videos/{job}')
   scene['status']=result.get('status','unknown')
   usage=result.get('usage') or {}
@@ -400,6 +429,73 @@ def check():
    save_video_jobs(jobs)
   return jsonify({'status':scene['status'],'file':scene.get('file',''),'error':result.get('error'),'usage':usage})
  except Exception as e:return jsonify(error=str(e)),400
+@app.post('/api/colab/next')
+@require_worker
+def colab_next():
+ try:
+  with LOCK:
+   jobs=load_video_jobs();data=load()
+   job=next((x for x in reversed(jobs) if x.get('model')==COLAB_MODEL and x.get('status')=='queued'),None)
+   if not job:return jsonify(job=None)
+   job['status']='running';job['started_at']=datetime.now(timezone.utc).isoformat()
+   save_video_jobs(jobs)
+   slug=job.get('slug');sid=job.get('scene_id')
+   try:
+    ep,scene=locate(data,slug,sid);scene['status']='processing';save(data)
+   except Exception:pass
+  return jsonify(job={'id':job['job_id'],'episode':job.get('slug',''),'scene':job.get('scene_id'),'prompt':job.get('prompt') or '','duration':job.get('duration',8),'aspect_ratio':job.get('aspect_ratio','9:16'),'resolution':job.get('resolution','720p'),'scene_title':job.get('scene_title',''),'episode_title':job.get('episode_title','')})
+ except Exception as e:return jsonify(error=str(e)),400
+
+@app.post('/api/colab/result/<job_id>')
+@require_worker
+def colab_result(job_id):
+ try:
+  if not is_colab_job(job_id) or '/' in job_id or '..' in job_id:raise ValueError('Invalid job ID')
+  status=(request.form.get('status') or 'done').strip().lower()
+  error=(request.form.get('error') or '').strip()
+  with LOCK:
+   jobs=load_video_jobs();record=next((x for x in jobs if x.get('job_id')==job_id),None)
+   if not record:raise ValueError('Unknown job')
+   data=load();ep,scene=locate(data,record['slug'],record['scene_id'])
+   if status=='failed':
+    record['status']='failed';record['error']=error or 'Colab worker failed'
+    scene['status']='failed';scene['file']=''
+   else:
+    upload=request.files.get('video')
+    if upload is None or not upload.filename:raise ValueError('Missing video file')
+    dest=OUTPUT/f"{ep['slug']}_scene{int(scene['id']):02d}.mp4"
+    upload.save(dest)
+    record['status']='done';record['file']=dest.name;record['error']='';record['completed_at']=datetime.now(timezone.utc).isoformat()
+    scene['status']='completed';scene['file']=dest.name;scene['usage_cost']=0;scene['completed_at']=record['completed_at']
+   save_video_jobs(jobs);save(data)
+  return jsonify(ok=True,status=record['status'],file=record.get('file',''))
+ except Exception as e:return jsonify(error=str(e)),400
+
+@app.get('/api/colab/jobs')
+@require_worker
+def colab_jobs():
+ try:
+  jobs=[x for x in load_video_jobs() if x.get('model')==COLAB_MODEL or is_colab_job(x.get('job_id'))]
+  return jsonify(data=jobs)
+ except Exception as e:return jsonify(error=str(e)),400
+
+@app.post('/api/colab/requeue/<job_id>')
+@require_worker
+def colab_requeue(job_id):
+ try:
+  if not is_colab_job(job_id):raise ValueError('Invalid job ID')
+  with LOCK:
+   jobs=load_video_jobs();record=next((x for x in jobs if x.get('job_id')==job_id),None)
+   if not record:raise ValueError('Unknown job')
+   record['status']='queued';record['error']='';record.pop('started_at',None);record.pop('completed_at',None);record['file']=''
+   data=load()
+   try:
+    ep,scene=locate(data,record['slug'],record['scene_id']);scene['status']='pending';scene['file']='';save(data)
+   except Exception:pass
+   save_video_jobs(jobs)
+  return jsonify(ok=True)
+ except Exception as e:return jsonify(error=str(e)),400
+
 @app.get('/api/costs')
 def costs_data():
  try:
